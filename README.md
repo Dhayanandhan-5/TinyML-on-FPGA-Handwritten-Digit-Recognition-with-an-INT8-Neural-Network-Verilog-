@@ -1,0 +1,1 @@
+# TinyML-on-FPGA-Handwritten-Digit-Recognition-with-an-INT8-Neural-Network-Verilog-

@@ -1,0 +1,2022 @@
+# ============================================================
+# TinyML MNIST - HARDWARE-MATCHED QAT
+#
+# Architecture:
+#       784 -> 64 -> 32 -> 16 -> 10
+#
+# Hardware:
+#
+# Input:
+#       pixel [0,1]
+#          |
+#       floor(pixel * 128)
+#          |
+#       signed INT8
+#
+# Every layer:
+#
+#       W INT8
+#          |
+#       X INT8
+#          |
+#       INT8 x INT8
+#          |
+#       INT32 MAC
+#          |
+#       + INT8 bias
+#          |
+#       + 64
+#          |
+#       >>> 7
+#          |
+#       INT8 saturation
+#          |
+#       ReLU
+#
+# Output:
+#       10 INT8 values
+#          |
+#        argmax
+#          |
+#       digit 0-9
+#
+# QAT:
+#       Float master weights
+#             |
+#       fake INT8 Q1.7
+#             |
+#       hardware-like forward
+#             |
+#       STE gradient
+# ============================================================
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.metrics import confusion_matrix
+
+from google.colab import files
+
+
+# ============================================================
+# 1. DEVICE
+# ============================================================
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print("Using device:", device)
+
+
+# ============================================================
+# 2. RANDOM SEED
+# ============================================================
+
+SEED = 42
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+
+# ============================================================
+# 3. MNIST DATASET
+#
+# IMPORTANT:
+#
+# ONLY ToTensor()
+#
+# NO Normalize()
+#
+# Hardware receives pixels in [0,1]
+# and performs:
+#
+# floor(pixel * 128)
+# ============================================================
+
+transform = transforms.ToTensor()
+
+
+train_dataset = datasets.MNIST(
+    root="./data",
+    train=True,
+    download=True,
+    transform=transform
+)
+
+
+test_dataset = datasets.MNIST(
+    root="./data",
+    train=False,
+    download=True,
+    transform=transform
+)
+
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=128,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=True
+)
+
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=256,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
+
+
+print()
+print("Training samples:", len(train_dataset))
+print("Testing samples :", len(test_dataset))
+
+
+# ============================================================
+# 4. MODEL
+#
+# 784 -> 64 -> 32 -> 16 -> 10
+# ============================================================
+
+class DenseMNIST(nn.Module):
+
+    def __init__(self):
+
+        super(DenseMNIST, self).__init__()
+
+        self.layer1 = nn.Linear(784, 64)
+        self.layer2 = nn.Linear(64, 32)
+        self.layer3 = nn.Linear(32, 16)
+        self.layer4 = nn.Linear(16, 10)
+
+    def forward(self, x):
+
+        x = x.view(-1, 784)
+
+        x = torch.relu(
+            self.layer1(x)
+        )
+
+        x = torch.relu(
+            self.layer2(x)
+        )
+
+        x = torch.relu(
+            self.layer3(x)
+        )
+
+        x = self.layer4(x)
+
+        return x
+
+
+# ============================================================
+# 5. FLOATING POINT PRE-TRAINING
+#
+# We first train a normal model.
+#
+# Then QAT fine-tunes this trained model.
+#
+# This is much more stable than starting QAT
+# from random weights.
+# ============================================================
+
+model = DenseMNIST().to(device)
+
+
+criterion = nn.CrossEntropyLoss()
+
+
+optimizer = optim.Adam(
+    model.parameters(),
+    lr=0.003
+)
+
+
+FLOAT_EPOCHS = 3
+
+
+print()
+print("==============================================")
+print("FLOATING-POINT PRE-TRAINING")
+print("==============================================")
+
+
+for epoch in range(FLOAT_EPOCHS):
+
+    model.train()
+
+    running_loss = 0.0
+
+    for data, target in train_loader:
+
+        data = data.to(
+            device,
+            non_blocking=True
+        )
+
+        target = target.to(
+            device,
+            non_blocking=True
+        )
+
+
+        optimizer.zero_grad()
+
+
+        output = model(data)
+
+
+        loss = criterion(
+            output,
+            target
+        )
+
+
+        loss.backward()
+
+
+        optimizer.step()
+
+
+        running_loss += loss.item()
+
+
+    print(
+        f"Epoch {epoch+1}/{FLOAT_EPOCHS} "
+        f"Loss = "
+        f"{running_loss / len(train_loader):.4f}"
+    )
+
+
+print("Floating-point pre-training complete.")
+
+
+# ============================================================
+# 6. FLOATING POINT TEST ACCURACY
+# ============================================================
+
+def evaluate_float(model):
+
+    model.eval()
+
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+
+        for data, target in test_loader:
+
+            data = data.to(device)
+            target = target.to(device)
+
+            output = model(data)
+
+            prediction = torch.argmax(
+                output,
+                dim=1
+            )
+
+            correct += (
+                prediction == target
+            ).sum().item()
+
+            total += target.size(0)
+
+
+    return 100.0 * correct / total
+
+
+float_accuracy = evaluate_float(model)
+
+
+print()
+print(
+    f"Floating-Point Test Accuracy : "
+    f"{float_accuracy:.2f}%"
+)
+
+
+# ============================================================
+# 7. HARDWARE QUANTIZATION CONSTANTS
+# ============================================================
+
+SCALE = 128.0
+
+QMIN = -128
+QMAX = 127
+
+
+# ============================================================
+# 8. STE ROUND
+#
+# Forward:
+#       round(x)
+#
+# Backward:
+#       gradient passes approximately as identity
+#
+# This is the Straight-Through Estimator.
+# ============================================================
+
+def ste_round(x):
+
+    rounded = torch.round(x)
+
+    return (
+        rounded.detach()
+        + x
+        - x.detach()
+    )
+
+
+# ============================================================
+# 9. STE FLOOR
+#
+# Hardware input uses:
+#
+#       floor(pixel * 128)
+#
+# We use floor in forward pass but preserve gradient.
+# ============================================================
+
+def ste_floor(x):
+
+    floored = torch.floor(x)
+
+    return (
+        floored.detach()
+        + x
+        - x.detach()
+    )
+
+
+# ============================================================
+# 10. INT8 WEIGHT QUANTIZATION
+#
+# Hardware:
+#
+#       q = round(weight * 128)
+#
+#       clip [-128,127]
+#
+#       dequant = q / 128
+#
+# STE allows gradients to reach the floating point
+# master weights.
+# ============================================================
+
+def fake_quant_weight(w):
+
+    q = ste_round(
+        w * SCALE
+    )
+
+    q = torch.clamp(
+        q,
+        QMIN,
+        QMAX
+    )
+
+    q = q / SCALE
+
+    return q
+
+
+# ============================================================
+# 11. HARDWARE INPUT QUANTIZATION
+#
+# Hardware:
+#
+#       floor(pixel * 128)
+#
+#       clip to INT8
+#
+#       dequantize only for PyTorch computation
+#
+# The actual forward value corresponds to INT8.
+# ============================================================
+
+def fake_quant_input(x):
+
+    q = ste_floor(
+        x * SCALE
+    )
+
+    q = torch.clamp(
+        q,
+        QMIN,
+        QMAX
+    )
+
+    q = q / SCALE
+
+    return q
+
+
+# ============================================================
+# 12. HARDWARE-MATCHED QAT LINEAR
+#
+# IMPORTANT:
+#
+# This reproduces:
+#
+#   Wq = round(W*128)
+#   Xq = quantized INT8 activation
+#
+#   ACC = Wq @ Xq
+#
+#   ACC = ACC + Bq
+#
+#   ACC = ACC + 64
+#
+#   ACC = ACC >>> 7
+#
+#   saturation
+#
+#   ReLU
+#
+# We keep the tensors as float for PyTorch autograd,
+# but their forward values correspond to the integer
+# hardware arithmetic.
+# ============================================================
+
+def qat_hardware_linear(
+    x,
+    weight,
+    bias,
+    relu=True
+):
+
+    # --------------------------------------------------------
+    # Quantize weight
+    # --------------------------------------------------------
+
+    wq = fake_quant_weight(
+        weight
+    )
+
+    # --------------------------------------------------------
+    # Convert to hardware integer domain
+    #
+    # x is already represented as Q1.7
+    # --------------------------------------------------------
+
+    x_int = x * SCALE
+    w_int = wq * SCALE
+
+    # --------------------------------------------------------
+    # INT32-equivalent MAC
+    #
+    # PyTorch uses float storage here,
+    # but values are integer-valued.
+    # --------------------------------------------------------
+
+    acc = torch.matmul(
+        x_int,
+        w_int.t()
+    )
+
+    # --------------------------------------------------------
+    # Quantized bias
+    #
+    # Hardware stores bias as INT8.
+    # --------------------------------------------------------
+
+    b_int = ste_round(
+        bias * SCALE
+    )
+
+    b_int = torch.clamp(
+        b_int,
+        QMIN,
+        QMAX
+    )
+
+    # --------------------------------------------------------
+    # Add bias
+    # --------------------------------------------------------
+
+    acc = acc + b_int
+
+
+    # --------------------------------------------------------
+    # Hardware rounding before shift
+    #
+    # Hardware:
+    #
+    #       (acc + 64) >>> 7
+    #
+    # --------------------------------------------------------
+
+    acc = acc + 64.0
+
+
+    # --------------------------------------------------------
+    # Arithmetic right shift equivalent
+    #
+    # IMPORTANT:
+    #
+    # We use floor(acc / 128), which corresponds to
+    # arithmetic right shift for signed integers.
+    # --------------------------------------------------------
+
+    scaled = ste_floor(
+        acc / SCALE
+    )
+
+
+    # --------------------------------------------------------
+    # INT8 saturation
+    # --------------------------------------------------------
+
+    scaled = torch.clamp(
+        scaled,
+        QMIN,
+        QMAX
+    )
+
+
+    # --------------------------------------------------------
+    # Convert back to Q1.7 representation
+    #
+    # This represents the actual INT8 value.
+    # --------------------------------------------------------
+
+    output = scaled / SCALE
+
+
+    # --------------------------------------------------------
+    # ReLU
+    # --------------------------------------------------------
+
+    if relu:
+
+        output = torch.relu(
+            output
+        )
+
+
+    return output
+
+
+# ============================================================
+# 13. QAT MODEL
+# ============================================================
+
+class HardwareQATModel(nn.Module):
+
+    def __init__(self):
+
+        super(
+            HardwareQATModel,
+            self
+        ).__init__()
+
+
+        self.layer1 = nn.Linear(
+            784,
+            64
+        )
+
+        self.layer2 = nn.Linear(
+            64,
+            32
+        )
+
+        self.layer3 = nn.Linear(
+            32,
+            16
+        )
+
+        self.layer4 = nn.Linear(
+            16,
+            10
+        )
+
+
+    def forward(self, x):
+
+        # ----------------------------------------------------
+        # Flatten
+        # ----------------------------------------------------
+
+        x = x.view(
+            -1,
+            784
+        )
+
+
+        # ----------------------------------------------------
+        # Hardware input:
+        #
+        # pixel [0,1]
+        #       ↓
+        # floor(pixel*128)
+        #       ↓
+        # INT8
+        # ----------------------------------------------------
+
+        x = fake_quant_input(
+            x
+        )
+
+
+        # ----------------------------------------------------
+        # Layer 1
+        # 784 -> 64
+        # ----------------------------------------------------
+
+        x = qat_hardware_linear(
+            x,
+            self.layer1.weight,
+            self.layer1.bias,
+            relu=True
+        )
+
+
+        # ----------------------------------------------------
+        # Layer 2
+        # 64 -> 32
+        # ----------------------------------------------------
+
+        x = qat_hardware_linear(
+            x,
+            self.layer2.weight,
+            self.layer2.bias,
+            relu=True
+        )
+
+
+        # ----------------------------------------------------
+        # Layer 3
+        # 32 -> 16
+        # ----------------------------------------------------
+
+        x = qat_hardware_linear(
+            x,
+            self.layer3.weight,
+            self.layer3.bias,
+            relu=True
+        )
+
+
+        # ----------------------------------------------------
+        # Layer 4
+        # 16 -> 10
+        #
+        # NO ReLU
+        # ----------------------------------------------------
+
+        x = qat_hardware_linear(
+            x,
+            self.layer4.weight,
+            self.layer4.bias,
+            relu=False
+        )
+
+
+        return x
+
+
+# ============================================================
+# 14. COPY FLOATING POINT WEIGHTS INTO QAT MODEL
+# ============================================================
+
+qat_model = HardwareQATModel().to(device)
+
+
+qat_model.layer1.load_state_dict(
+    model.layer1.state_dict()
+)
+
+qat_model.layer2.load_state_dict(
+    model.layer2.state_dict()
+)
+
+qat_model.layer3.load_state_dict(
+    model.layer3.state_dict()
+)
+
+qat_model.layer4.load_state_dict(
+    model.layer4.state_dict()
+)
+
+
+print()
+print("Floating-point weights copied into QAT model.")
+
+
+# ============================================================
+# 15. CHECK INITIAL HARDWARE-MATCHED ACCURACY
+# ============================================================
+
+def evaluate_qat(model):
+
+    model.eval()
+
+    correct = 0
+    total = 0
+
+
+    with torch.no_grad():
+
+        for data, target in test_loader:
+
+            data = data.to(device)
+            target = target.to(device)
+
+
+            output = model(data)
+
+
+            prediction = torch.argmax(
+                output,
+                dim=1
+            )
+
+
+            correct += (
+                prediction == target
+            ).sum().item()
+
+
+            total += target.size(0)
+
+
+    return 100.0 * correct / total
+
+
+initial_qat_accuracy = evaluate_qat(
+    qat_model
+)
+
+
+print()
+print(
+    "Initial hardware-matched "
+    "INT8 accuracy:"
+)
+
+print(
+    f"{initial_qat_accuracy:.2f}%"
+)
+
+
+# ============================================================
+# 16. QAT TRAINING
+#
+# We fine-tune the pretrained network.
+#
+# Small learning rate is important.
+# ============================================================
+
+QAT_EPOCHS = 8
+
+qat_optimizer = optim.Adam(
+    qat_model.parameters(),
+    lr=0.0001,
+    weight_decay=1e-5
+)
+
+
+print()
+print("==============================================")
+print("QUANTIZATION-AWARE TRAINING")
+print("==============================================")
+
+
+best_accuracy = 0.0
+
+best_state = None
+
+
+for epoch in range(QAT_EPOCHS):
+
+
+    qat_model.train()
+
+    running_loss = 0.0
+
+
+    for data, target in train_loader:
+
+        data = data.to(
+            device,
+            non_blocking=True
+        )
+
+        target = target.to(
+            device,
+            non_blocking=True
+        )
+
+
+        qat_optimizer.zero_grad()
+
+
+        output = qat_model(
+            data
+        )
+
+
+        loss = criterion(
+            output,
+            target
+        )
+
+
+        loss.backward()
+
+
+        # ----------------------------------------------------
+        # Gradient clipping
+        #
+        # Prevents QAT weights from exploding.
+        # ----------------------------------------------------
+
+        torch.nn.utils.clip_grad_norm_(
+            qat_model.parameters(),
+            max_norm=1.0
+        )
+
+
+        qat_optimizer.step()
+
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Keep master weights inside the hardware
+        # representable Q1.7 range.
+        #
+        # This prevents the previous problem where weights
+        # exploded to +/-5.
+        # ----------------------------------------------------
+
+        with torch.no_grad():
+
+            for layer in [
+                qat_model.layer1,
+                qat_model.layer2,
+                qat_model.layer3,
+                qat_model.layer4
+            ]:
+
+                layer.weight.clamp_(
+                    QMIN / SCALE,
+                    QMAX / SCALE
+                )
+
+                layer.bias.clamp_(
+                    QMIN / SCALE,
+                    QMAX / SCALE
+                )
+
+
+        running_loss += loss.item()
+
+
+    # --------------------------------------------------------
+    # Test after every epoch
+    # --------------------------------------------------------
+
+    test_accuracy = evaluate_qat(
+        qat_model
+    )
+
+
+    print(
+        f"Epoch [{epoch+1}/{QAT_EPOCHS}] "
+        f"Loss = "
+        f"{running_loss / len(train_loader):.4f} "
+        f"| INT8 Accuracy = "
+        f"{test_accuracy:.2f}%"
+    )
+
+
+    # --------------------------------------------------------
+    # Save best model
+    # --------------------------------------------------------
+
+    if test_accuracy > best_accuracy:
+
+        best_accuracy = test_accuracy
+
+        best_state = {
+            k: v.detach().cpu().clone()
+            for k, v in qat_model.state_dict().items()
+        }
+
+
+# ============================================================
+# 17. RESTORE BEST QAT MODEL
+# ============================================================
+
+if best_state is not None:
+
+    qat_model.load_state_dict(
+        best_state
+    )
+
+
+print()
+print(
+    "Best QAT accuracy:",
+    f"{best_accuracy:.2f}%"
+)
+
+
+# ============================================================
+# 18. FINAL QAT ACCURACY
+# ============================================================
+
+final_qat_accuracy = evaluate_qat(
+    qat_model
+)
+
+
+print()
+print("==============================================")
+print("FINAL RESULTS")
+print("==============================================")
+
+print(
+    f"Floating-Point Accuracy : "
+    f"{float_accuracy:.2f}%"
+)
+
+print(
+    f"QAT / INT8 Accuracy     : "
+    f"{final_qat_accuracy:.2f}%"
+)
+
+print(
+    f"Accuracy Difference     : "
+    f"{float_accuracy-final_qat_accuracy:.2f}"
+    f" percentage points"
+)
+
+print("==============================================")
+
+
+# ============================================================
+# 19. EXACT INTEGER INFERENCE
+#
+# This is extremely important.
+#
+# After QAT, we perform a second inference using actual
+# integer NumPy arithmetic matching the FPGA/MATLAB model.
+#
+# This verifies that the exported files and QAT model
+# really agree.
+# ============================================================
+
+
+def numpy_quantize_weight(w):
+
+    q = np.round(
+        w * 128
+    )
+
+    q = np.clip(
+        q,
+        -128,
+        127
+    )
+
+    return q.astype(
+        np.int8
+    )
+
+
+def numpy_quantize_bias(b):
+
+    q = np.round(
+        b * 128
+    )
+
+    q = np.clip(
+        q,
+        -128,
+        127
+    )
+
+    return q.astype(
+        np.int8
+    )
+
+
+# ------------------------------------------------------------
+# Extract QAT weights
+# ------------------------------------------------------------
+
+W1 = (
+    qat_model.layer1.weight
+    .detach()
+    .cpu()
+    .numpy()
+)
+
+B1 = (
+    qat_model.layer1.bias
+    .detach()
+    .cpu()
+    .numpy()
+)
+
+
+W2 = (
+    qat_model.layer2.weight
+    .detach()
+    .cpu()
+    .numpy()
+)
+
+B2 = (
+    qat_model.layer2.bias
+    .detach()
+    .cpu()
+    .numpy()
+)
+
+
+W3 = (
+    qat_model.layer3.weight
+    .detach()
+    .cpu()
+    .numpy()
+)
+
+B3 = (
+    qat_model.layer3.bias
+    .detach()
+    .cpu()
+    .numpy()
+)
+
+
+W4 = (
+    qat_model.layer4.weight
+    .detach()
+    .cpu()
+    .numpy()
+)
+
+B4 = (
+    qat_model.layer4.bias
+    .detach()
+    .cpu()
+    .numpy()
+)
+
+
+# ------------------------------------------------------------
+# Quantize
+# ------------------------------------------------------------
+
+W1_q = numpy_quantize_weight(W1)
+B1_q = numpy_quantize_bias(B1)
+
+W2_q = numpy_quantize_weight(W2)
+B2_q = numpy_quantize_bias(B2)
+
+W3_q = numpy_quantize_weight(W3)
+B3_q = numpy_quantize_bias(B3)
+
+W4_q = numpy_quantize_weight(W4)
+B4_q = numpy_quantize_bias(B4)
+
+
+# ============================================================
+# 20. EXACT HARDWARE LAYER
+#
+# This matches your MATLAB:
+#
+# p = int16(w).*int16(in)
+# si = int32(sum(p))
+# s = si + bias
+# k = bitsra(s+64,7)
+#
+# then saturation + ReLU
+# ============================================================
+
+def exact_hardware_layer(
+    x,
+    W,
+    B,
+    relu=True
+):
+
+    # --------------------------------------------------------
+    # Convert to INT32 before multiplication
+    # --------------------------------------------------------
+
+    x32 = x.astype(
+        np.int32
+    )
+
+    W32 = W.astype(
+        np.int32
+    )
+
+    B32 = B.astype(
+        np.int32
+    )
+
+
+    # --------------------------------------------------------
+    # MAC
+    #
+    # W shape:
+    #   output_neurons x input_neurons
+    #
+    # x shape:
+    #   input_neurons
+    # --------------------------------------------------------
+
+    acc = W32 @ x32
+
+
+    # --------------------------------------------------------
+    # Bias
+    # --------------------------------------------------------
+
+    acc = acc + B32
+
+
+    # --------------------------------------------------------
+    # Hardware:
+    #
+    #       +64
+    #       >>>7
+    #
+    # For signed integer arithmetic this is floor division
+    # by 128.
+    # --------------------------------------------------------
+
+    acc = np.floor_divide(
+        acc + 64,
+        128
+    )
+
+
+    # --------------------------------------------------------
+    # INT8 saturation
+    # --------------------------------------------------------
+
+    acc = np.clip(
+        acc,
+        -128,
+        127
+    )
+
+
+    # --------------------------------------------------------
+    # ReLU
+    # --------------------------------------------------------
+
+    if relu:
+
+        acc[acc < 0] = 0
+
+
+    return acc.astype(
+        np.int8
+    )
+
+
+# ============================================================
+# 21. EXACT HARDWARE INFERENCE
+# ============================================================
+
+def exact_hardware_inference(
+    image
+):
+
+    # --------------------------------------------------------
+    # Hardware input conversion:
+    #
+    # floor(pixel * 128)
+    # --------------------------------------------------------
+
+    x = np.floor(
+        image * 128
+    )
+
+
+    x = np.clip(
+        x,
+        -128,
+        127
+    )
+
+
+    x = x.astype(
+        np.int8
+    )
+
+
+    # --------------------------------------------------------
+    # 28x28 -> 784
+    # --------------------------------------------------------
+
+    x = x.reshape(
+        -1
+    )
+
+
+    # --------------------------------------------------------
+    # Layer 1
+    # --------------------------------------------------------
+
+    x = exact_hardware_layer(
+        x,
+        W1_q,
+        B1_q,
+        relu=True
+    )
+
+
+    # --------------------------------------------------------
+    # Layer 2
+    # --------------------------------------------------------
+
+    x = exact_hardware_layer(
+        x,
+        W2_q,
+        B2_q,
+        relu=True
+    )
+
+
+    # --------------------------------------------------------
+    # Layer 3
+    # --------------------------------------------------------
+
+    x = exact_hardware_layer(
+        x,
+        W3_q,
+        B3_q,
+        relu=True
+    )
+
+
+    # --------------------------------------------------------
+    # Layer 4
+    # --------------------------------------------------------
+
+    x = exact_hardware_layer(
+        x,
+        W4_q,
+        B4_q,
+        relu=False
+    )
+
+
+    # --------------------------------------------------------
+    # Argmax
+    # --------------------------------------------------------
+
+    prediction = int(
+        np.argmax(x)
+    )
+
+
+    return prediction, x
+
+
+# ============================================================
+# 22. EXACT HARDWARE TEST ACCURACY
+# ============================================================
+
+print()
+print("==============================================")
+print("EXACT INTEGER HARDWARE VERIFICATION")
+print("==============================================")
+
+
+exact_predictions = []
+exact_targets = []
+
+correct_exact = 0
+
+
+for idx in range(
+    len(test_dataset)
+):
+
+
+    image, target = test_dataset[idx]
+
+
+    image_np = (
+        image
+        .numpy()
+        .squeeze()
+    )
+
+
+    prediction, output = (
+        exact_hardware_inference(
+            image_np
+        )
+    )
+
+
+    exact_predictions.append(
+        prediction
+    )
+
+    exact_targets.append(
+        int(target)
+    )
+
+
+    if prediction == int(target):
+
+        correct_exact += 1
+
+
+    if (
+        (idx + 1) % 1000
+        == 0
+    ):
+
+        print(
+            f"Processed "
+            f"{idx+1}/10000"
+        )
+
+
+exact_accuracy = (
+    100.0 *
+    correct_exact /
+    len(test_dataset)
+)
+
+
+print()
+print(
+    f"Exact INT8 Hardware Accuracy : "
+    f"{exact_accuracy:.2f}%"
+)
+
+
+# ============================================================
+# 23. COMPARE QAT FLOAT FORWARD VS EXACT INTEGER
+# ============================================================
+#
+# These two accuracies should be very close.
+#
+# If they are different significantly, there is a mismatch
+# between QAT simulation and your actual MATLAB/Verilog
+# arithmetic.
+# ============================================================
+
+print()
+print("==============================================")
+print("ACCURACY COMPARISON")
+print("==============================================")
+
+print(
+    f"Floating Point : "
+    f"{float_accuracy:.2f}%"
+)
+
+print(
+    f"QAT Forward    : "
+    f"{final_qat_accuracy:.2f}%"
+)
+
+print(
+    f"Exact INT8     : "
+    f"{exact_accuracy:.2f}%"
+)
+
+print(
+    f"QAT vs Exact   : "
+    f"{abs(final_qat_accuracy-exact_accuracy):.2f}"
+    f" percentage points"
+)
+
+print("==============================================")
+
+
+# ============================================================
+# 24. CONFUSION MATRIX
+# ============================================================
+
+exact_predictions_np = np.array(
+    exact_predictions
+)
+
+exact_targets_np = np.array(
+    exact_targets
+)
+
+
+cm = confusion_matrix(
+    exact_targets_np,
+    exact_predictions_np
+)
+
+
+plt.figure(
+    figsize=(9,8)
+)
+
+
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    xticklabels=np.arange(10),
+    yticklabels=np.arange(10)
+)
+
+
+plt.xlabel(
+    "Predicted Digit",
+    fontsize=12
+)
+
+plt.ylabel(
+    "Actual Digit",
+    fontsize=12
+)
+
+
+plt.title(
+    "MNIST QAT INT8 Confusion Matrix",
+    fontsize=14
+)
+
+
+plt.tight_layout()
+
+
+plt.savefig(
+    "MNIST_QAT_Confusion_Matrix.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+
+plt.show()
+
+
+# ============================================================
+# 25. PER-DIGIT ACCURACY
+# ============================================================
+
+print()
+print("==============================================")
+print("PER-DIGIT INT8 ACCURACY")
+print("==============================================")
+
+
+for digit in range(10):
+
+    indices = (
+        exact_targets_np == digit
+    )
+
+
+    correct_digit = np.sum(
+        exact_predictions_np[indices]
+        == digit
+    )
+
+
+    total_digit = np.sum(
+        indices
+    )
+
+
+    accuracy_digit = (
+        100.0 *
+        correct_digit /
+        total_digit
+    )
+
+
+    print(
+        f"Digit {digit}: "
+        f"{accuracy_digit:.2f}%"
+    )
+
+
+print("==============================================")
+
+
+# ============================================================
+# 26. ACTIVATION RANGE ANALYSIS
+#
+# We report the actual QAT/hardware-domain activations.
+# ============================================================
+
+qat_model.eval()
+
+
+activation_values = {
+    "layer1": [],
+    "layer2": [],
+    "layer3": [],
+    "layer4": []
+}
+
+
+with torch.no_grad():
+
+    # Only analyze a subset for speed
+    count = 0
+
+    for data, target in test_loader:
+
+        data = data.to(device)
+
+
+        x = data.view(
+            -1,
+            784
+        )
+
+
+        # Input quantization
+
+        x = fake_quant_input(
+            x
+        )
+
+
+        # Layer 1
+
+        x = qat_hardware_linear(
+            x,
+            qat_model.layer1.weight,
+            qat_model.layer1.bias,
+            relu=True
+        )
+
+        activation_values[
+            "layer1"
+        ].append(
+            x.cpu().numpy()
+        )
+
+
+        # Layer 2
+
+        x = qat_hardware_linear(
+            x,
+            qat_model.layer2.weight,
+            qat_model.layer2.bias,
+            relu=True
+        )
+
+        activation_values[
+            "layer2"
+        ].append(
+            x.cpu().numpy()
+        )
+
+
+        # Layer 3
+
+        x = qat_hardware_linear(
+            x,
+            qat_model.layer3.weight,
+            qat_model.layer3.bias,
+            relu=True
+        )
+
+        activation_values[
+            "layer3"
+        ].append(
+            x.cpu().numpy()
+        )
+
+
+        # Layer 4
+
+        x = qat_hardware_linear(
+            x,
+            qat_model.layer4.weight,
+            qat_model.layer4.bias,
+            relu=False
+        )
+
+        activation_values[
+            "layer4"
+        ].append(
+            x.cpu().numpy()
+        )
+
+
+        count += 1
+
+        if count >= 20:
+            break
+
+
+print()
+print("==============================================")
+print("QAT ACTIVATION RANGES")
+print("==============================================")
+
+
+for name in activation_values:
+
+    values = np.concatenate(
+        activation_values[name]
+    ).flatten()
+
+
+    print()
+    print(name)
+
+
+    print(
+        f"Minimum : "
+        f"{values.min():.6f}"
+    )
+
+    print(
+        f"Maximum : "
+        f"{values.max():.6f}"
+    )
+
+    print(
+        f"Mean    : "
+        f"{values.mean():.6f}"
+    )
+
+    print(
+        f"> 0.992 : "
+        f"{100*np.mean(values >= 127/128):.2f}%"
+    )
+
+    print(
+        f"< 0     : "
+        f"{100*np.mean(values < 0):.2f}%"
+    )
+
+
+print()
+print("==============================================")
+
+
+# ============================================================
+# 27. WEIGHT RANGES
+# ============================================================
+
+print()
+print("==============================================")
+print("FINAL WEIGHT RANGES")
+print("==============================================")
+
+
+print(
+    "W1:",
+    W1.min(),
+    W1.max()
+)
+
+print(
+    "W2:",
+    W2.min(),
+    W2.max()
+)
+
+print(
+    "W3:",
+    W3.min(),
+    W3.max()
+)
+
+print(
+    "W4:",
+    W4.min(),
+    W4.max()
+)
+
+
+# ============================================================
+# 28. BIAS RANGES
+# ============================================================
+
+print()
+print("==============================================")
+print("FINAL BIAS RANGES")
+print("==============================================")
+
+
+print(
+    "B1:",
+    B1.min(),
+    B1.max()
+)
+
+print(
+    "B2:",
+    B2.min(),
+    B2.max()
+)
+
+print(
+    "B3:",
+    B3.min(),
+    B3.max()
+)
+
+print(
+    "B4:",
+    B4.min(),
+    B4.max()
+)
+
+
+# ============================================================
+# 29. QUANTIZATION / CLIPPING REPORT
+# ============================================================
+
+def quantization_report(
+    name,
+    W
+):
+
+    q = np.round(
+        W * 128
+    )
+
+
+    clipped = np.sum(
+        (q < -128) |
+        (q > 127)
+    )
+
+
+    total = q.size
+
+
+    print(
+        f"{name}: "
+        f"{clipped}/{total} "
+        f"("
+        f"{100.0*clipped/total:.4f}%"
+        f") clipped"
+    )
+
+
+    print(
+        f"    Float range: "
+        f"{W.min():.6f} "
+        f"to "
+        f"{W.max():.6f}"
+    )
+
+
+print()
+print("==============================================")
+print("FINAL WEIGHT QUANTIZATION")
+print("==============================================")
+
+
+quantization_report(
+    "W1",
+    W1
+)
+
+quantization_report(
+    "W2",
+    W2
+)
+
+quantization_report(
+    "W3",
+    W3
+)
+
+quantization_report(
+    "W4",
+    W4
+)
+
+
+# ============================================================
+# 30. EXPORT INT8 BINARY FILE
+#
+# Each line:
+#
+#       8-bit two's complement binary
+#
+# Example:
+#
+#       +5  -> 00000101
+#       -5  -> 11111011
+#
+# Ready for:
+#
+#       $readmemb(...)
+#
+# ============================================================
+
+def write_binary_file(
+    filename,
+    array
+):
+
+    flat = array.flatten()
+
+
+    with open(
+        filename,
+        "w"
+    ) as f:
+
+
+        for value in flat:
+
+            unsigned_value = (
+                int(value) & 0xFF
+            )
+
+
+            binary = format(
+                unsigned_value,
+                "08b"
+            )
+
+
+            f.write(
+                binary + "\n"
+            )
+
+
+# ============================================================
+# 31. EXPORT WEIGHTS
+# ============================================================
+
+write_binary_file(
+    "weights_784_to_64",
+    W1_q
+)
+
+
+write_binary_file(
+    "weights_64_to_32",
+    W2_q
+)
+
+
+write_binary_file(
+    "weights_32_to_16",
+    W3_q
+)
+
+
+write_binary_file(
+    "weights_16_to_10",
+    W4_q
+)
+
+
+# ============================================================
+# 32. EXPORT BIASES
+# ============================================================
+
+write_binary_file(
+    "biases_784_to_64",
+    B1_q
+)
+
+
+write_binary_file(
+    "biases_64_to_32",
+    B2_q
+)
+
+
+write_binary_file(
+    "biases_32_to_16",
+    B3_q
+)
+
+
+write_binary_file(
+    "biases_16_to_10",
+    B4_q
+)
+
+
+# ============================================================
+# 33. FINAL REPORT
+# ============================================================
+
+print()
+print("==============================================")
+print("INT8 BINARY FILES GENERATED")
+print("==============================================")
+
+
+print("weights_784_to_64")
+print("weights_64_to_32")
+print("weights_32_to_16")
+print("weights_16_to_10")
+
+
+print("biases_784_to_64")
+print("biases_64_to_32")
+print("biases_32_to_16")
+print("biases_16_to_10")
+
+
+print("MNIST_QAT_Confusion_Matrix.png")
+
+
+print("==============================================")
+
+
+# ============================================================
+# 34. DOWNLOAD FILES
+# ============================================================
+
+files_to_download = [
+
+    "weights_784_to_64",
+    "weights_64_to_32",
+    "weights_32_to_16",
+    "weights_16_to_10",
+
+    "biases_784_to_64",
+    "biases_64_to_32",
+    "biases_32_to_16",
+    "biases_16_to_10",
+
+    "MNIST_QAT_Confusion_Matrix.png"
+]
+
+
+print()
+print("Downloading files...")
+
+
+for filename in files_to_download:
+
+    files.download(
+        filename
+    )
+
+
+# ============================================================
+# 35. FINAL SUMMARY
+# ============================================================
+
+print()
+print()
+print("================================================")
+print("                 FINAL SUMMARY")
+print("================================================")
+
+print(
+    f"Floating-point accuracy : "
+    f"{float_accuracy:.2f}%"
+)
+
+print(
+    f"QAT accuracy             : "
+    f"{final_qat_accuracy:.2f}%"
+)
+
+print(
+    f"Exact INT8 accuracy      : "
+    f"{exact_accuracy:.2f}%"
+)
+
+print(
+    f"QAT vs Exact difference  : "
+    f"{abs(final_qat_accuracy-exact_accuracy):.2f}"
+    f" percentage points"
+)
+
+print("================================================")
+print("DONE")
+print("================================================")
